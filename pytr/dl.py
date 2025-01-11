@@ -196,6 +196,8 @@ class DL:
         self.log = get_logger(__name__)
         self.load_history()
 
+        self.break_loop = False
+
     def load_history(self):
         """
         Read history file with URLs if it exists, otherwise create empty file
