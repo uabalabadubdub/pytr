@@ -51,6 +51,8 @@ class DL:
         self.log = get_logger(__name__)
         self.load_history()
 
+        self.break_loop = False
+
     def load_history(self):
         """
         Read history file with URLs if it exists, otherwise create empty file
@@ -67,7 +69,7 @@ class DL:
     async def dl_loop(self):
         await self.tl.get_next_timeline_transactions()
 
-        while True:
+        while not self.break_loop:
             try:
                 _, subscription, response = await self.tr.recv()
             except TradeRepublicError as e:
@@ -198,7 +200,7 @@ class DL:
         """
         if len(self.doc_urls) == 0:
             self.log.info("Nothing to download")
-            exit(0)
+            self.break_loop == True
 
         with self.history_file.open("a") as history_file:
             self.log.info("Waiting for downloads to complete..")
@@ -223,4 +225,4 @@ class DL:
 
                 if self.done == len(self.doc_urls):
                     self.log.info("Done.")
-                    exit(0)
+                    self.break_loop == True
