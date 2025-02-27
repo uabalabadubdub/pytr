@@ -200,7 +200,8 @@ class DL:
         """
         if len(self.doc_urls) == 0:
             self.log.info("Nothing to download")
-            self.break_loop == True
+            self.break_loop = True
+            return
 
         with self.history_file.open("a") as history_file:
             self.log.info("Waiting for downloads to complete..")
@@ -225,4 +226,5 @@ class DL:
 
                 if self.done == len(self.doc_urls):
                     self.log.info("Done.")
-                    self.break_loop == True
+                    self.break_loop = True
+                    return
