@@ -1,155 +1,216 @@
 import asyncio
+import locale
+from decimal import ROUND_HALF_UP, Decimal
+from pathlib import Path
+from typing import Optional
 
-from pytr.utils import preview
+from .tickers import (
+    decimal_format,
+    fetch_instrument_details,
+    fetch_tickers,
+    normalize_lang,
+)
+from .utils import get_logger, preview
+
+PORTFOLIO_COLUMNS = [
+    "Name",
+    "ISIN",
+    "quantity",
+    "price",
+    "avgCost",
+    "netValue",
+]
 
 
 class Portfolio:
-    def __init__(self, tr):
+    def __init__(
+        self,
+        tr,
+        include_watchlist: bool = False,
+        instruments_to_ignore: Optional[list[str]] = None,
+        output=None,
+        lang: str = "en",
+        decimal_localization: bool = False,
+        sort_by_column: Optional[str] = "netValue",
+        sort_descending: bool = True,
+    ):
         self.tr = tr
+        self.include_watchlist = include_watchlist
+        self.instruments_to_ignore = instruments_to_ignore or []
+        self.output = output
+        self.lang = normalize_lang(lang)
+        self.decimal_localization = decimal_localization
+        self.sort_by_column = sort_by_column
+        self.sort_descending = sort_descending
+
+        self.watchlist: list[dict] = []
+
+        self._log = get_logger(__name__)
+
+    def _decimal_format(self, value, precision: int = 2):
+        return decimal_format(value, precision, self.decimal_localization, self.lang)
 
     async def portfolio_loop(self):
+        self._log.info("Querying portfolio...")
         recv = 0
-        # await self.tr.portfolio()
-        # recv += 1
         await self.tr.compact_portfolio()
         recv += 1
         await self.tr.cash()
         recv += 1
-        # await self.tr.available_cash_for_payout()
-        # recv += 1
+        if self.include_watchlist:
+            await self.tr.watchlist()
+            recv += 1
 
         while recv > 0:
             subscription_id, subscription, response = await self.tr.recv()
 
-            if subscription["type"] == "portfolio":
+            if subscription["type"] == "compactPortfolioByType":
                 recv -= 1
-                self.portfolio = response
-            elif subscription["type"] == "compactPortfolio":
-                recv -= 1
-                self.portfolio = response
+                # New format: positions are grouped in categories[].positions
+                # Flatten all categories and normalize the field name: new API uses
+                # "isin" where the old "compactPortfolio" used "instrumentId".
+                self.positions = []
+                for cat in response.get("categories", []):
+                    for pos in cat.get("positions", []):
+                        if "isin" in pos and "instrumentId" not in pos:
+                            pos["instrumentId"] = pos["isin"]
+                        self.positions.append(pos)
             elif subscription["type"] == "cash":
                 recv -= 1
                 self.cash = response
-            # elif subscription['type'] == 'availableCashForPayout':
-            #     recv -= 1
-            #     self.payoutCash = response
+            elif subscription["type"] == "watchlist":
+                recv -= 1
+                self.watchlist = response
             else:
-                print(
-                    f"unmatched subscription of type '{subscription['type']}':\n{preview(response)}"
-                )
+                print(f"unmatched subscription of type '{subscription['type']}':\n{preview(response)}")
 
             await self.tr.unsubscribe(subscription_id)
 
-        # Populate name for each ISIN
-        subscriptions = {}
-        positions = self.portfolio["positions"]
-        for pos in sorted(positions, key=lambda x: x["netSize"], reverse=True):
-            isin = pos["instrumentId"]
-            subscription_id = await self.tr.instrument_details(pos["instrumentId"])
-            subscriptions[subscription_id] = pos
+        isins = set()
+        positions = list()
+        for pos in self.positions:
+            if pos["instrumentId"] not in self.instruments_to_ignore:
+                positions.append(pos)
+                isins.add(pos["instrumentId"])
+        self.positions = positions
 
-        while len(subscriptions) > 0:
-            subscription_id, subscription, response = await self.tr.recv()
+        # extend portfolio with watchlist elements
+        for pos in self.watchlist:
+            if pos["instrumentId"] not in isins and pos["instrumentId"] not in self.instruments_to_ignore:
+                isins.add(pos["instrumentId"])
+                self.positions.append(pos)
 
-            if subscription["type"] == "instrument":
-                await self.tr.unsubscribe(subscription_id)
-                pos = subscriptions[subscription_id]
-                subscriptions.pop(subscription_id, None)
-                pos["name"] = response["shortName"]
-                pos["exchangeIds"] = response["exchangeIds"]
-            else:
-                print(
-                    f"unmatched subscription of type '{subscription['type']}':\n{preview(response)}"
-                )
-
-        # Populate netValue for each ISIN
-        subscriptions = {}
-        for pos in sorted(positions, key=lambda x: x["netSize"], reverse=True):
-            isin = pos["instrumentId"]
-            if len(pos["exchangeIds"]) > 0:
-                subscription_id = await self.tr.ticker(
-                    isin, exchange=pos["exchangeIds"][0]
-                )
-                subscriptions[subscription_id] = pos
-            else:
-                pos["netValue"] = float(pos["averageBuyIn"]) * float(pos["netSize"])
-
-        while len(subscriptions) > 0:
-            subscription_id, subscription, response = await self.tr.recv()
-
-            if subscription["type"] == "ticker":
-                await self.tr.unsubscribe(subscription_id)
-                pos = subscriptions[subscription_id]
-                subscriptions.pop(subscription_id, None)
-                pos["netValue"] = float(response["last"]["price"]) * float(
-                    pos["netSize"]
-                )
-            else:
-                print(
-                    f"unmatched subscription of type '{subscription['type']}':\n{preview(response)}"
-                )
-
-    def portfolio_to_csv(self, output_path):
-        positions = self.portfolio["positions"]
-        csv_lines = []
-        for pos in sorted(positions, key=lambda x: x["netSize"], reverse=True):
-            csv_lines.append(
-                f"{pos['name']};{pos['instrumentId']};{float(pos['netSize']):>10.3f};{float(pos['averageBuyIn']):.2f};{float(pos['netValue']):.2f}"
+        self._log.info("Subscribing to tickers...")
+        await fetch_instrument_details(self.tr, self.positions)
+        missing = await fetch_tickers(self.tr, self.positions)
+        for pos in missing:
+            print(
+                f"Missing price for {pos.get('name', pos['instrumentId'])} ({pos['instrumentId']}), removing from result."
             )
 
-        with open(output_path, "w", encoding="utf-8") as f:
-            f.write("Name;ISIN;quantity;avgCost;netValue\n")
-            f.write("\n".join(csv_lines))
+        self.positions = [pos for pos in self.positions if "price" in pos]
 
-        print(f"Wrote {len(csv_lines) + 1} lines to {output_path}")
+        # Compute netValue from price and netSize (netSize comes from the portfolio, not tickers)
+        for pos in self.positions:
+            # watchlist positions don't have size/value
+            if "netSize" not in pos:
+                pos["netSize"] = "0"
+                pos["averageBuyIn"] = pos["price"]
+            pos["netValue"] = (Decimal(pos["price"]) * Decimal(pos["netSize"])).quantize(
+                Decimal("0.01"), rounding=ROUND_HALF_UP
+            )
+
+        await self.tr.close()
+
+    def _get_sort_func(self):
+        match self.sort_by_column:
+            case "Name":
+                if self.lang == "de":
+                    locale.setlocale(locale.LC_COLLATE, "de_DE.UTF-8")
+                return lambda x: locale.strxfrm(x["name"].lower())
+            case "ISIN":
+                if self.lang == "de":
+                    locale.setlocale(locale.LC_COLLATE, "de_DE.UTF-8")
+                return lambda x: locale.strxfrm(x["instrumentId"].lower())
+            case "quantity":
+                return lambda x: Decimal(x["netSize"])
+            case "price":
+                return lambda x: Decimal(x["price"])
+            case "avgCost":
+                return lambda x: Decimal(x["averageBuyIn"])
+            case _ as m:
+                if m != "netValue":
+                    print(f"Column {m} does not exist for portfolio list, reverting to default sorting by netValue.")
+                return lambda x: Decimal(x["netValue"])
+
+    def write_csv(self):
+        if self.output is None:
+            return
+
+        csv_lines = []
+        for pos in sorted(self.positions, key=self._get_sort_func(), reverse=self.sort_descending):
+            csv_lines.append(
+                f"{pos['name']};"
+                f"{pos['instrumentId']};"
+                f"{self._decimal_format(pos['netSize'], precision=6)};"
+                f"{self._decimal_format(pos['price'], precision=4)};"
+                f"{self._decimal_format(pos['averageBuyIn'], precision=4)};"
+                f"{self._decimal_format(pos['netValue'])}"
+            )
+
+        Path(self.output).parent.mkdir(parents=True, exist_ok=True)
+        with open(self.output, "w", encoding="utf-8") as f:
+            f.write(";".join(PORTFOLIO_COLUMNS) + "\n")
+            f.write("\n".join(csv_lines) + ("\n" if csv_lines else ""))
+
+        print(f"Wrote {len(csv_lines) + 1} lines to {self.output}")
 
     def overview(self):
-        # for x in ['netValue', 'unrealisedProfit', 'unrealisedProfitPercent', 'unrealisedCost']:
-        #     print(f'{x:24}: {self.portfolio[x]:>10.2f}')
-        # print()
+        totalBuyCost = Decimal("0")
+        totalNetValue = Decimal("0")
 
-        print(
-            "Name                      ISIN            avgCost *   quantity =    buyCost ->   netValue       diff   %-diff"
-        )
-        totalBuyCost = 0.0
-        totalNetValue = 0.0
-        positions = self.portfolio["positions"]
-        for pos in sorted(positions, key=lambda x: x["netSize"], reverse=True):
-            # pos['netValue'] = 0 # TODO: Update the value from each Stock request
-            buyCost = float(pos["averageBuyIn"]) * float(pos["netSize"])
-            diff = float(pos["netValue"]) - buyCost
-            if buyCost == 0:
-                diffP = 0.0
-            else:
-                diffP = ((pos["netValue"] / buyCost) - 1) * 100
-            totalBuyCost += buyCost
-            totalNetValue += float(pos["netValue"])
-
+        if not self.output:
             print(
-                f"{pos['name']:<25.25} {pos['instrumentId']} {float(pos['averageBuyIn']):>10.2f} * {float(pos['netSize']):>10.3f}"
-                + f" = {float(buyCost):>10.2f} -> {float(pos['netValue']):>10.2f} {diff:>10.2f} {diffP:>7.1f}%"
+                "Name                      ISIN            avgCost *   quantity =    buyCost ->   netValue      price       diff   %-diff"
             )
 
-        print(
-            "Name                      ISIN            avgCost *   quantity =    buyCost ->   netValue       diff   %-diff"
-        )
-        print()
+        for pos in sorted(self.positions, key=self._get_sort_func(), reverse=self.sort_descending):
+            buyCost = (Decimal(pos["averageBuyIn"]) * Decimal(pos["netSize"])).quantize(
+                Decimal("0.01"), rounding=ROUND_HALF_UP
+            )
+            diff = pos["netValue"] - buyCost
+            diffP = 0.0 if buyCost == 0 else ((pos["netValue"] / buyCost) - 1) * 100
+            totalBuyCost = totalBuyCost + buyCost
+            totalNetValue = totalNetValue + pos["netValue"]
+
+            if not self.output:
+                print(
+                    f"{pos['name']:<25.25} "
+                    f"{pos['instrumentId']} "
+                    f"{Decimal(pos['averageBuyIn']):>10.2f} * "
+                    f"{Decimal(pos['netSize']):>10.6f} = "
+                    f"{buyCost:>10.2f} -> "
+                    f"{pos['netValue']:>10.2f} "
+                    f"{Decimal(pos['price']):>10.2f} "
+                    f"{diff:>10.2f} "
+                    f"{diffP:>7.1f}%"
+                )
+
+        if not self.output:
+            print(
+                "Name                      ISIN            avgCost *   quantity =    buyCost ->   netValue      price       diff   %-diff"
+            )
+            print()
 
         diff = totalNetValue - totalBuyCost
-        if totalBuyCost == 0:
-            diffP = 0.0
-        else:
-            diffP = ((totalNetValue / totalBuyCost) - 1) * 100
-        print(
-            f"Depot {totalBuyCost:>43.2f} -> {totalNetValue:>10.2f} {diff:>10.2f} {diffP:>7.1f}%"
-        )
-
-        cash = float(self.cash[0]["amount"])
-        currency = self.cash[0]["currencyId"]
-        print(f"Cash {currency} {cash:>40.2f} -> {cash:>10.2f}")
-        print(f"Total {cash+totalBuyCost:>43.2f} -> {cash+totalNetValue:>10.2f}")
+        diffP = 0.0 if totalBuyCost == 0 else ((totalNetValue / totalBuyCost) - 1) * 100
+        cash = Decimal(self.cash[0]["amount"])
+        print(f"Depot {totalBuyCost:>43.2f} -> {totalNetValue:>10.2f} {diff:>10.2f} {diffP:>7.1f}%")
+        print(f"Cash {self.cash[0]['currencyId']} {cash:>40.2f}")
+        print(f"Total {cash + totalBuyCost:>43.2f} -> {cash + totalNetValue:>10.2f}")
 
     def get(self):
-        asyncio.get_event_loop().run_until_complete(self.portfolio_loop())
+        asyncio.run(self.portfolio_loop())
 
         self.overview()
+        self.write_csv()
