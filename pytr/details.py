@@ -1,6 +1,7 @@
 import asyncio
-from pytr.utils import preview
 from datetime import datetime, timedelta
+
+from pytr.utils import preview
 
 
 class Details:
@@ -46,11 +47,10 @@ class Details:
                 self.instrumentSuitability = response
                 print("instrumentSuitability:", response)
             else:
-                print(
-                    f"unmatched subscription of type '{subscription['type']}':\n{preview(response, num_lines=30)}"
-                )
+                print(f"unmatched subscription of type '{subscription['type']}':\n{preview(response, num_lines=30)}")
 
             if recv == 6:
+                await self.tr.close()
                 return
 
     def print_instrument(self):
@@ -69,11 +69,7 @@ class Details:
             if company[company_detail] is not None:
                 print(f"{company_detail:15}: {company[company_detail]}")
         for detail in self.stockDetails:
-            if (
-                detail != "company"
-                and self.stockDetails[detail] is not None
-                and self.stockDetails[detail] != []
-            ):
+            if detail != "company" and self.stockDetails[detail] is not None and self.stockDetails[detail] != []:
                 print(f"{detail:15}: {self.stockDetails[detail]}")
 
     def news(self, relevant_days=30):
@@ -92,6 +88,6 @@ class Details:
         self.stock_details()
 
     def get(self):
-        asyncio.get_event_loop().run_until_complete(self.details_loop())
+        asyncio.run(self.details_loop())
 
         self.overview()
